@@ -12,7 +12,7 @@
     ModuleToProcess = 'DbBackupControl.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.0.0'
+    ModuleVersion = '1.0.2'
 
     # Supported PSEditions
     # CompatiblePSEditions = @()
@@ -27,7 +27,7 @@
     CompanyName       = 'Unknown'
 
     # Copyright statement for this module
-    Copyright         = '(c) 2022 SAGSA. All rights reserved.'
+    Copyright         = '(c) 2023 SAGSA. All rights reserved.'
 
     # Description of the functionality provided by this module
     Description       = 'Powershell module helps maintenance sql backup'
@@ -72,7 +72,7 @@
     FunctionsToExport=@("Remove-DbBackup","New-FakeBackup")
 
     # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
-    CmdletsToExport = @("Remove-DbBackup","New-FakeBackup")
+    #CmdletsToExport = @("Remove-DbBackup","New-FakeBackup")
 
     # Variables to export from this module
     #VariablesToExport = '*'
@@ -108,8 +108,8 @@
 
             # ReleaseNotes of this module
             ReleaseNotes = @' 
-## 1.0.0
-*   first release
+## 1.0.2
+*   Added support for cloud storage (Implemented using rclone) 
 '@
 
         } # End of PSData hashTable

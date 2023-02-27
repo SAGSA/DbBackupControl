@@ -1,4 +1,5 @@
-﻿<#
+﻿function Remove-DbBackup{
+<#
 .SYNOPSIS
     Removes MSSQL and other sql Server backups from disk or ftp.
 .DESCRIPTION
@@ -61,11 +62,10 @@
     Author: SAGSA
     https://github.com/SAGSA/DbBackupControl
     Requires: Powershell 2.0
-#>
-function Remove-DbBackup{
+#>    
     [cmdletbinding(SupportsShouldProcess=$true)]
     param(
-        [ValidateScript({($_ -match "^ftp://") -or $_ -match "^\w:\\"})]
+        [ValidateScript({($_ -match "^ftp://") -or $_ -match "^\w+:"})]
         [string[]]$Path,
         [ValidateScript({-not ($_ -match "\s+")})]
         [string[]]$DbName,
@@ -170,7 +170,177 @@ function Remove-DbBackup{
     
     
 }
+function StartRcloneApiServer{
+    [cmdletbinding()]
+    param(
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+    )
+    try{
+        if(-not (Test-Path -Path $RclonePath)){
+            Write-Error "Incorrect path $RclonePath Rclone Not found" -ErrorAction Stop
+        }
+        if($Global:RcloneServer -ne $null){
+            $Global:RcloneServer.PowerShell.Dispose()
+            Remove-Variable -Scope Global -Name RcloneServer -WhatIf:$false
+        }
+    
+        $SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        Get-Command -CommandType Function -Name InvokeExe | foreach {
+            $SessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList $_.name, $_.Definition         
+            Write-Verbose "Add script Function $($_.name)"
+            $SessionState.Commands.Add($SessionStateFunction)
+                
+        }
+        $RunspacePool = [runspacefactory]::CreateRunspacePool(1,1,$SessionState,$Host)
+        $RunspacePool.Open()
 
+        [ScriptBlock]$SbRunspace={
+        param(
+            $FilePath
+        )
+
+            $Args=@(
+                "rcd",
+                "--rc-no-auth"
+            )
+            $Res=InvokeExe -ExeFile $FilePath -Args $Args
+            $Res
+        }
+        $PowerShell = [powershell]::Create()
+        [void]$PowerShell.AddScript($SbRunspace)
+        $ParamList=@{}
+        $ParamList.Add("FilePath",$(get-variable -Name RclonePath -ValueOnly))
+        [void]$PowerShell.AddParameters($ParamList)
+        $PowerShell.Runspacepool = $RunspacePool
+        $State = $PowerShell.BeginInvoke()
+        $temp = '' | Select PowerShell,State,StartTime
+        $temp.powershell=$PowerShell
+        $temp.state=$State
+        $temp.StartTime=get-date
+    
+        New-Variable -Scope Global -Name RcloneServer -Value $temp -WhatIf:$false | Out-Null
+    }
+    catch{
+        Write-Error $_
+    }
+    
+    
+}
+function Remove-ItemRclone{
+    [cmdletbinding(SupportsShouldProcess=$true)]
+    param(
+        [parameter(Mandatory=$true)]
+        [string]$Path,
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+    )
+    $RcloneArgs=@(
+        "lsjson",
+        $Path   
+    )
+    
+    if($Path -match "(.+:)(.*)$"){
+        $Fs=$Matches[1]
+        $Remote=$Matches[2]
+    }
+    else{
+        Write-Error "Incorrect path $Path" -ErrorAction Stop
+    }
+    $ApiParam='{"fs": '+'"'+$Fs+'", "remote": '+'"'+$Remote+'"'+'}'
+    if ($RcloneServer.State.IsCompleted -ne $false){
+        StartRcloneApiServer -ErrorAction Stop
+        if ($RcloneServer.State.IsCompleted -ne $false){
+            Write-Error "Rclone Server api not working" -ErrorAction Stop
+        }
+        
+    }
+    if ($([bool]$WhatIfPreference.IsPresent) -eq $false){
+        $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/deletefile" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -ErrorAction Stop
+        if ($Res.StatusCode -ne 200){
+            Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
+        }
+    }
+    else{
+        Write-Host "WhatIf: Remove-ItemRclone -Path $Path"
+    }
+    
+}
+function Get-ChildItemRclone{
+    [cmdletbinding()]
+    param(
+        [parameter(Mandatory=$true)]
+        [string]$Path,
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+    )
+    $RcloneArgs=@(
+        "lsjson",
+        $Path   
+    )
+    
+    if($Path -match "(.+:)(.*)$"){
+        $Fs=$Matches[1]
+        $Remote=$Matches[2]
+    }
+    else{
+        Write-Error "Incorrect path $Path" -ErrorAction Stop
+    }
+    $ApiParam='{"fs": '+'"'+$Fs+'", "remote": '+'"'+$Remote+'"}'
+    if ($RcloneServer.State.IsCompleted -ne $false){
+        StartRcloneApiServer -ErrorAction Stop
+        if ($RcloneServer.State.IsCompleted -ne $false){
+            Write-Error "Rclone Server api not working" -ErrorAction Stop
+        }
+        
+    }
+    $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/list" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -ErrorAction Stop
+    if ($Res.StatusCode -ne 200){
+        Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
+    }
+    $ItemsInfo=($Res.content | ConvertFrom-Json).list
+    $ItemsInfo | foreach {
+        $Path=$_.Path
+        $Name=$_.name
+        $IsContainer=$_.IsDir
+        $FullName=$Fs+$Path
+        $Item=New-Object -TypeName psobject -Property @{
+                Name=$Name
+                FullName=$FullName
+                PSIsContainer=$IsContainer
+        }
+        $Item
+    }
+    
+    <#$Res=InvokeExe -ExeFile $RclonePath -Args $RcloneArgs -Encoding 65001
+    if ($Res.exitcode -ne 0){
+        Write-Error "StdErr: $($Res.StdErr) StdOut: $($Res.StOut)" -ErrorAction Stop
+    }
+    $Items=$Res.stdout
+    if(-not ($Res.stdout -match "]$")){
+        $Items=($Res.stdout -replace "]")+"]"
+    }
+    $ItemsInfo=$Items | ConvertFrom-Json 
+    $ItemsInfo | foreach {
+        $Name=$_.name
+        $IsContainer=$_.IsDir
+        if($Path -match ".+:$"){
+            $FullName="$Path"+$Name
+        }
+        elseif($Path -match "$Name$"){
+            $FullName=$Path
+        }
+        else{
+            $FullName="$Path\"+$Name
+        }
+        
+        
+        $Item=New-Object -TypeName psobject -Property @{
+                Name=$Name
+                FullName=$FullName
+                PSIsContainer=$IsContainer
+        }
+        $Item
+    }#>
+}
+function New-FakeBackup{
 <#
 .SYNOPSIS
     Creates the specified number of false backups
@@ -186,7 +356,6 @@ function Remove-DbBackup{
     https://github.com/SAGSA/DbBackupControl
     Requires: Powershell 2.0
 #>
-function New-FakeBackup{
     [CmdletBinding()]
     param(
         [parameter(Mandatory=$true)]
@@ -344,7 +513,162 @@ function Create-RemoveDbBackupJsonConfig{
     
     
 }
+function InvokeExe{
+    <#
+    .NOTES
+        Author: SAGSA
+        https://github.com/SAGSA/PostgresCmdlets
+        Requires: Powershell 2.0
+    #>
+    [cmdletbinding()]
+        param(
+            [Parameter(Mandatory=$true)]
+            [ValidateNotNullOrEmpty()]
+            [String]$ExeFile,
+            [Parameter(Mandatory=$false)]
+            [String[]]$Args,
+            [hashtable]$EnvVar,
+            [switch]$VerboseOutput,
+            [string]$LogPath,
+            [Parameter(Mandatory=$false)]
+            [String]$Verb,
+            [int]$Encoding
+        )    
+        if (!([string]::IsNullOrEmpty($PSBoundParameters["LogPath"])))
+        {
+            New-Item -ItemType File -Path $LogPath -ErrorAction Stop -Force | Out-Null
+        }
+        $oPsi = New-Object -TypeName System.Diagnostics.ProcessStartInfo
+        [string[]]$MUILanguages=(Get-WmiObject -query "select MUILanguages from win32_operatingsystem" ).MUILanguages
+        if ($PSBoundParameters['Encoding'] -ne $null)
+        {
+            $ProcessEncoding=[System.Text.Encoding]::GetEncoding($Encoding)
+        }
+        elseif($MUILanguages -eq "ru-RU")
+        {
+            $ProcessEncoding=[System.Text.Encoding]::GetEncoding(1251)
+        }
+        $oPsi.StandardOutputEncoding=$ProcessEncoding
+        $oPsi.StandardErrorEncoding=$ProcessEncoding
+        $oPsi.CreateNoWindow = $true
+        $oPsi.UseShellExecute = $false
+        $oPsi.RedirectStandardOutput = $true
+        $oPsi.RedirectStandardError = $true
+        if ($PSBoundParameters["EnvVar"] -ne $null)
+        {
+            $EnvVar.Keys | foreach {
+                [string]$Key=$_
+                [string]$Value=$EnvVar[$Key]
+                $oPsi.EnvironmentVariables.Add($Key,$Value)
+            }
+        }
+        $oPsi.FileName = $ExeFile
+    
+        if (! [String]::IsNullOrEmpty($Args)) 
+        {
+            $oPsi.Arguments = $Args
+        }
+        if (! [String]::IsNullOrEmpty($Verb)) 
+        {
+            $oPsi.Verb = $Verb
+        }
+    
+        $oProcess = New-Object -TypeName System.Diagnostics.Process
+        $oProcess.StartInfo = $oPsi
 
+        $oStdOutBuilder = New-Object -TypeName System.Text.StringBuilder
+        $oStdErrBuilder = New-Object -TypeName System.Text.StringBuilder
+        $StdOutObject=New-Object -TypeName psobject
+        $StdErrObject=New-Object -TypeName psobject
+        $StdOutObject | Add-Member -MemberType NoteProperty -Name StrBuilder -Value $oStdOutBuilder
+        $StdOutObject | Add-Member -MemberType NoteProperty -Name LogPath -Value $LogPath
+        $StdOutObject | Add-Member -MemberType NoteProperty -Name VerboseOutput -Value $($PSBoundParameters["VerboseOutput"].IsPresent)
+        $StdErrObject | Add-Member -MemberType NoteProperty -Name StrBuilder -Value $oStdErrBuilder
+        $StdErrObject | Add-Member -MemberType NoteProperty -Name LogPath -Value $LogPath
+        $StdErrObject | Add-Member -MemberType NoteProperty -Name VerboseOutput -Value $($PSBoundParameters["VerboseOutput"].IsPresent)
+
+        $sScripBlock = {
+            if (!([String]::IsNullOrEmpty($EventArgs.Data))) 
+            {
+                
+                if (!($Event.MessageData.VerboseOutput -eq $true) -and [string]::IsNullOrEmpty($event.MessageData.LogPath))
+                {
+                    $Event.MessageData.StrBuilder.AppendLine($EventArgs.Data)    
+                }
+                else
+                {
+                    if (!([string]::IsNullOrEmpty($event.MessageData.LogPath)))
+                    {
+                        $($EventArgs.Data) | Out-File -FilePath $($event.MessageData.LogPath) -Append -Force -WhatIf:$false -Confirm:$false  -ErrorAction Stop 
+                    }
+                    if ($Event.MessageData.VerboseOutput -eq $true)
+                    {
+                        Write-Verbose "$($EventArgs.Data)" -Verbose     
+                    }    
+                }
+                
+                
+                
+                    
+  
+            }
+        }
+        $oStdOutEvent = Register-ObjectEvent -InputObject $oProcess -Action $sScripBlock -EventName 'OutputDataReceived' -MessageData $StdOutObject
+        $oStdErrEvent = Register-ObjectEvent -InputObject $oProcess -Action $sScripBlock -EventName 'ErrorDataReceived' -MessageData $StdErrObject
+        Unregister-Event -SourceIdentifier ProcessExitedEvent -Confirm:$false -WhatIf:$false -ErrorAction SilentlyContinue
+        Remove-Event -SourceIdentifier ProcessExitedEvent -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
+        Register-ObjectEvent -InputObject $oProcess -EventName 'Exited' -SourceIdentifier ProcessExitedEvent
+        
+        [Void]$oProcess.Start()
+         
+        $oProcess.BeginOutputReadLine()
+        $oProcess.BeginErrorReadLine()
+        $ProcessClose=$false
+        try
+        {
+                if ($PSBoundParameters["VerboseOutput"].isPresent -or !([string]::IsNullOrEmpty($PSBoundParameters["LogPath"])))
+                {  
+                    do 
+                    {
+                        Start-Sleep -Milliseconds 5
+                    }while(!($oProcess.HasExited))    
+                    $ProcessClose=$true
+                }
+                else
+                {
+         
+                        Wait-Event -SourceIdentifier ProcessExitedEvent -ErrorAction Stop | Out-Null
+                        $ProcessClose=$true
+                
+                }
+        }
+        finally
+        {
+                if (!($ProcessClose))
+                {
+                    Write-Verbose "Try stop process $($oProcess.ID) $($oProcess.name)"
+                    Stop-Process -Id $($oProcess.ID) -WhatIf:$false -Confirm:$false -Force    
+                }
+                
+                Unregister-Event -SourceIdentifier $oStdOutEvent.Name -Confirm:$false -WhatIf:$false
+                Unregister-Event -SourceIdentifier $oStdErrEvent.Name -Confirm:$false -WhatIf:$false
+                Unregister-Event -SourceIdentifier ProcessExitedEvent -Confirm:$false -WhatIf:$false
+                Remove-Event -SourceIdentifier ProcessExitedEvent -Confirm:$false -WhatIf:$false -ErrorAction SilentlyContinue
+        }
+
+    
+        
+        
+        $oResult = New-Object -TypeName PSObject -Property (@{
+            "ExeFile"  = $ExeFile;
+            "Args"     = $Args -join " ";
+            "ExitCode" = $oProcess.ExitCode;
+            "StdOut"   = $StdOutObject.StrBuilder.ToString().Trim();
+            "StdErr"   = $StdErrObject.StrBuilder.ToString().Trim();
+        })
+
+        return $oResult
+}
 function CreateEventlogSource {
     [cmdletbinding()]
     param(
@@ -626,13 +950,18 @@ function RemoveDump{
     try{
         if ($StorageType -eq "Disk"){
             if (Test-Path $Path){
-                Remove-Item -Path $Path -Force -WhatIf:$([bool]$WhatIfPreference.IsPresent) -ErrorAction Stop
+                #Write-Debug -Message debug -Debug
+                Remove-Item -Path $Path -WhatIf:$([bool]$WhatIfPreference.IsPresent) -ErrorAction Stop
             }
             else{
                 Write-Verbose "$Path already removed"
             }
         } 
-        else{
+        elseif($StorageType -eq "Cloud"){
+            Remove-ItemRclone -Path $Path -WhatIf:$([bool]$WhatIfPreference.IsPresent) -ErrorAction Stop
+        }
+        else
+        {
             #Write-Debug -Message dbg -Debug
             Write-Verbose "RemoveFtpItem -Path $Path"
             RemoveFtpItem -Path $Path -Credential $Credential  -WhatIf:$([bool]$WhatIfPreference.IsPresent)  -ErrorAction Stop
@@ -701,11 +1030,14 @@ function GetDirRecurse{
     )
     
     if ($PSBoundParameters['Deph'] -gt 0){
-        if ($Path -match "^ftp://"){
-           $Dirs=ListFtpDirectory -Url $Path -Credential $Credential
+        if ($Path -match "^.+:\\"){
+           $Dirs=Get-ChildItem -Path $Path
+        }
+        elseif($Path -match "^ftp://"){
+            $Dirs=ListFtpDirectory -Url $Path -Credential $Credential
         }
         else{
-            $Dirs=Get-ChildItem -Path $Path
+           $Dirs=Get-ChildItemRclone -Path $Path
         }
          
         $NestedDirs=$Dirs | Where-Object {$_.PSIsContainer}
@@ -738,7 +1070,23 @@ function GetDumps{
     )
     [string[]]$OtherMssqlExtensions="diff","trn"
     $AllPaths=@()
-    if ($BackupPath -match "^ftp://"){
+    if ($BackupPath -match "^.+:\\"){
+        $AllPaths+=Get-Item -Path $BackupPath -ErrorAction Stop
+        $Storage="disk"
+    }
+    elseif($BackupPath -match "^ftp://"){
+        $AllPaths+=New-Object -TypeName psobject -Property @{
+            FullName=$BackupPath   
+        }
+        $Storage="ftp"
+    }
+    else{
+        $AllPaths+=New-Object -TypeName psobject -Property @{
+            FullName=$BackupPath   
+        }
+        $Storage="cloud"
+    }
+    <#if ($BackupPath -match "^ftp://"){
         $AllPaths+=New-Object -TypeName psobject -Property @{
             FullName=$BackupPath   
         }
@@ -747,7 +1095,7 @@ function GetDumps{
     else{
         $AllPaths+=Get-Item -Path $BackupPath -ErrorAction Stop
         $Storage="disk"
-    }
+    }#>
     
     if($Deph -ge 1){
         $AllPaths+=GetDirRecurse -Path $BackupPath -Deph $Deph  -Credential $Credential  
@@ -755,15 +1103,26 @@ function GetDumps{
     
     $AllPaths | foreach {
         $Path=$_.fullname
-        
-        if ($Path -match "^ftp://"){
+        if ($BackupPath -match "^.+:\\"){
+            Write-Verbose "Get-ChildItem -Path $Path"
+            $DumpItems=Get-ChildItem -Path $Path 
+        }
+        elseif($BackupPath -match "^ftp://"){
+            Write-Verbose "ListFtpDirectory -Url $Path"
+            $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
+        }
+        else{
+            Write-Verbose "Get-ChildItemRclone -Path $Path"
+            $DumpItems=Get-ChildItemRclone -Path $Path
+        }
+        <#if ($Path -match "^ftp://"){
             Write-Verbose "ListFtpDirectory -Url $Path"
             $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
         }
         else{
             Write-Verbose "Get-ChildItem -Path $Path"
             $DumpItems=Get-ChildItem -Path $Path    
-        }
+        }#>
         
         $AllBackups=$DumpItems | Where-Object {$_.PSIsContainer -eq $false}
         $OutObjects=@()
@@ -988,7 +1347,11 @@ function RemoveOldDumps{
         [int]$RecurseDeph,
         $Credential
     )
-
+    $StartRcloneServer=$false
+    if($DumpPaths -match "^mega:.+"){
+        StartRcloneApiServer -ErrorAction Stop
+        $StartRcloneServer=$true
+    }
     $AllDumps = New-Object System.Collections.ArrayList
     foreach ($DumpPath in $DumpPaths){
         Write-Verbose "GetDumps -BackupPath $DumpPath -Deph $RecurseDeph"
@@ -1107,7 +1470,10 @@ function RemoveOldDumps{
     else{
         Write-Verbose "Old backup versions not found" -Verbose
     }
-
+    if($StartRcloneServer){
+        $RcloneServer.PowerShell.Dispose()
+        Remove-Variable -Name RcloneServer -Force -Scope Global -WhatIf:$false
+    }
 
 }
 function RenameBackup{

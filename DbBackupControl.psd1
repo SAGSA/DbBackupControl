@@ -12,7 +12,7 @@
     ModuleToProcess = 'DbBackupControl.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.0.2'
+    ModuleVersion = '1.0.3'
 
     # Supported PSEditions
     # CompatiblePSEditions = @()
@@ -108,8 +108,8 @@
 
             # ReleaseNotes of this module
             ReleaseNotes = @' 
-## 1.0.2
-*   Added support for cloud storage (Implemented using rclone) 
+## 1.0.3
+*   bugfixed 
 '@
 
         } # End of PSData hashTable

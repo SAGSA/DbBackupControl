@@ -58,6 +58,9 @@
     After executing this command, the following will be saved:
     - 12 last monthly backups made 1 and 28 day of month
     - 6 last yearly bakups made 1 and 365 day of year
+.EXAMPLE
+    Remove-DbBackup -Path mega: -Deph 3 -KeepVersions 3
+    Only the 3 latest versions of the database copy on mega cloud storage will be kept. You need to download rclone to the C:\Windows\PsScript folder and configure it. https://rclone.org/
 .NOTES
     Author: SAGSA
     https://github.com/SAGSA/DbBackupControl
@@ -173,17 +176,25 @@
 function StartRcloneApiServer{
     [cmdletbinding()]
     param(
-        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe",
+        [parameter(Mandatory=$true)]
+        $RcloneCredential
     )
     try{
+        
         if(-not (Test-Path -Path $RclonePath)){
             Write-Error "Incorrect path $RclonePath Rclone Not found" -ErrorAction Stop
         }
+        $WRcloneCommandLine="'"+'"'+$($RclonePath -replace "\\","\\")+'"'+" rcd%"+"'"
+        Get-WmiObject -Query "Select * FROM win32_process WHERE CommandLine like $WRcloneCommandLine" | foreach{
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        }
         if($Global:RcloneServer -ne $null){
             $Global:RcloneServer.PowerShell.Dispose()
-            Remove-Variable -Scope Global -Name RcloneServer -WhatIf:$false
+            Remove-Variable -Scope Global -Name RcloneServer -WhatIf:$false   
         }
-    
+        $RcloneUser=$RcloneCredential.UserName
+        $RclonePassword=GetPlainTextPassword -SecString $RcloneCredential.Password
         $SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         Get-Command -CommandType Function -Name InvokeExe | foreach {
             $SessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList $_.name, $_.Definition         
@@ -196,20 +207,27 @@ function StartRcloneApiServer{
 
         [ScriptBlock]$SbRunspace={
         param(
-            $FilePath
+            [string]$FilePath,
+            [string]$RcloneUser,
+            [string]$RclonePassword
         )
 
-            $Args=@(
+            [string]$RcPassParam=$("--rc-pass="+"$RclonePassword")
+            $RcloneArgs=@(
                 "rcd",
-                "--rc-no-auth"
+                "--rc-user=$RcloneUser",
+                "--rc-pass=$RclonePassword"
             )
-            $Res=InvokeExe -ExeFile $FilePath -Args $Args
+            
+            $Res=InvokeExe -ExeFile $FilePath -Args $RcloneArgs
             $Res
         }
         $PowerShell = [powershell]::Create()
         [void]$PowerShell.AddScript($SbRunspace)
         $ParamList=@{}
         $ParamList.Add("FilePath",$(get-variable -Name RclonePath -ValueOnly))
+        $ParamList.Add("RcloneUser",$(get-variable -Name RcloneUser -ValueOnly))
+        $ParamList.Add("RclonePassword",$(get-variable -Name RclonePassword -ValueOnly))
         [void]$PowerShell.AddParameters($ParamList)
         $PowerShell.Runspacepool = $RunspacePool
         $State = $PowerShell.BeginInvoke()
@@ -231,7 +249,9 @@ function Remove-ItemRclone{
     param(
         [parameter(Mandatory=$true)]
         [string]$Path,
-        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe",
+        [parameter(Mandatory=$true)]
+        $RcloneCredential
     )
     $RcloneArgs=@(
         "lsjson",
@@ -247,14 +267,15 @@ function Remove-ItemRclone{
     }
     $ApiParam='{"fs": '+'"'+$Fs+'", "remote": '+'"'+$Remote+'"'+'}'
     if ($RcloneServer.State.IsCompleted -ne $false){
-        StartRcloneApiServer -ErrorAction Stop
+        #StartRcloneApiServer -ErrorAction Stop
         if ($RcloneServer.State.IsCompleted -ne $false){
             Write-Error "Rclone Server api not working" -ErrorAction Stop
         }
         
     }
     if ($([bool]$WhatIfPreference.IsPresent) -eq $false){
-        $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/deletefile" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -ErrorAction Stop
+        Write-Verbose "Delete file $Path"
+        $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/deletefile" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
         if ($Res.StatusCode -ne 200){
             Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
         }
@@ -269,7 +290,9 @@ function Get-ChildItemRclone{
     param(
         [parameter(Mandatory=$true)]
         [string]$Path,
-        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe"
+        [string]$RclonePath="$env:SystemRoot\psscript\rclone.exe",
+        [parameter(Mandatory=$true)]
+        $RcloneCredential
     )
     $RcloneArgs=@(
         "lsjson",
@@ -285,13 +308,13 @@ function Get-ChildItemRclone{
     }
     $ApiParam='{"fs": '+'"'+$Fs+'", "remote": '+'"'+$Remote+'"}'
     if ($RcloneServer.State.IsCompleted -ne $false){
-        StartRcloneApiServer -ErrorAction Stop
+        #StartRcloneApiServer -ErrorAction Stop
         if ($RcloneServer.State.IsCompleted -ne $false){
             Write-Error "Rclone Server api not working" -ErrorAction Stop
         }
         
     }
-    $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/list" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -ErrorAction Stop
+    $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/list" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
     if ($Res.StatusCode -ne 200){
         Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
     }
@@ -945,7 +968,8 @@ function RemoveDump{
         [string]$Path,
         [parameter(Mandatory=$true)]
         [string]$StorageType,
-        $Credential
+        $Credential,
+        $RcloneCredential
     )
     try{
         if ($StorageType -eq "Disk"){
@@ -958,7 +982,7 @@ function RemoveDump{
             }
         } 
         elseif($StorageType -eq "Cloud"){
-            Remove-ItemRclone -Path $Path -WhatIf:$([bool]$WhatIfPreference.IsPresent) -ErrorAction Stop
+            Remove-ItemRclone -Path $Path -RcloneCredential $RcloneCredential -WhatIf:$([bool]$WhatIfPreference.IsPresent) -ErrorAction Stop
         }
         else
         {
@@ -1026,7 +1050,8 @@ function GetDirRecurse{
         [parameter(Mandatory=$true)]
         [ValidateRange(0,5)]
         [int]$Deph,
-        $Credential
+        $Credential,
+        $RcloneCredential
     )
     
     if ($PSBoundParameters['Deph'] -gt 0){
@@ -1037,7 +1062,7 @@ function GetDirRecurse{
             $Dirs=ListFtpDirectory -Url $Path -Credential $Credential
         }
         else{
-           $Dirs=Get-ChildItemRclone -Path $Path
+           $Dirs=Get-ChildItemRclone -Path $Path -RcloneCredential $RcloneCredential
         }
          
         $NestedDirs=$Dirs | Where-Object {$_.PSIsContainer}
@@ -1047,7 +1072,7 @@ function GetDirRecurse{
                
                     if ($PSBoundParameters['Deph'] -gt 1){
                         $Deph-=1
-                        GetDirRecurse -Path $NestedDir.fullname -Deph $Deph -Credential $Credential
+                        GetDirRecurse -Path $NestedDir.fullname -Deph $Deph -Credential $Credential -RcloneCredential $RcloneCredential
                         $Deph+=1
                     }
                 }
@@ -1066,7 +1091,8 @@ function GetDumps{
         [string]$BackupPath,
         [ValidateRange(0,100)]
         [int]$Deph=0,
-        $Credential
+        $Credential,
+        $RcloneCredential
     )
     [string[]]$OtherMssqlExtensions="diff","trn"
     $AllPaths=@()
@@ -1098,7 +1124,7 @@ function GetDumps{
     }#>
     
     if($Deph -ge 1){
-        $AllPaths+=GetDirRecurse -Path $BackupPath -Deph $Deph  -Credential $Credential  
+        $AllPaths+=GetDirRecurse -Path $BackupPath -Deph $Deph  -Credential $Credential -RcloneCredential $RcloneCredential 
     }
     
     $AllPaths | foreach {
@@ -1113,7 +1139,7 @@ function GetDumps{
         }
         else{
             Write-Verbose "Get-ChildItemRclone -Path $Path"
-            $DumpItems=Get-ChildItemRclone -Path $Path
+            $DumpItems=Get-ChildItemRclone -Path $Path -RcloneCredential $RcloneCredential
         }
         <#if ($Path -match "^ftp://"){
             Write-Verbose "ListFtpDirectory -Url $Path"
@@ -1347,133 +1373,146 @@ function RemoveOldDumps{
         [int]$RecurseDeph,
         $Credential
     )
-    $StartRcloneServer=$false
-    if($DumpPaths -match "^mega:.+"){
-        StartRcloneApiServer -ErrorAction Stop
-        $StartRcloneServer=$true
-    }
-    $AllDumps = New-Object System.Collections.ArrayList
-    foreach ($DumpPath in $DumpPaths){
-        Write-Verbose "GetDumps -BackupPath $DumpPath -Deph $RecurseDeph"
-        GetDumps -BackupPath $DumpPath -Deph $RecurseDeph -Credential $Credential | foreach {
-            $AllDumps.Add($_) | Out-Null
+    try{
+        $StartRcloneServer=$false
+        if($DumpPaths -match ".+:[^\\//]" -or $DumpPaths -match ".+:$"){
+            $RcloneUser="rclone"
+            $RclonePassword=NewPassword
+            $RcloneCredential=CreateCredential -User $RcloneUser -Password $RclonePassword
+            StartRcloneApiServer -ErrorAction Stop -RcloneCredential $RcloneCredential
+            Write-Verbose "Set StartRcloneServer true"
+            $StartRcloneServer=$true
         }
-    }
-    if ([int]$AllDumps.count -eq 0){
-        Write-Error "Backup not found" -ErrorAction Stop
-    }
-
-    $MustBeRemoved=@()
-    $AllKeepSettings | foreach {
-        $BaseName=$_.basename
-        $KeepSettings=$_
-        $AllDumpsBase=@()
-    
-
-            $AllDumps.Clone() | Where-Object {$_.BaseName -eq $BaseName} | foreach {
-                $AllDumpsBase+=$_
-                $AllDumps.Remove($_)
-            } 
-    
-            if ($AllDumpsBase.Count -ne 0){
-                GetOldDumps -Dumps $AllDumpsBase -KeepSettings $KeepSettings | foreach {
-                    $MustBeRemoved+=$_
-            
-                }
-            }
-            else{
-                Write-Verbose "Skip Base $BaseName"
-            }
-        
-    }
-
-    if ($AllDumps.count -ne 0 -and !([string]::IsNullOrEmpty($DefaultKeepSettings))){
-        $BaseNames=$AllDumps | Select-Object -Property BaseName -Unique | foreach {$_.basename}
-        $BaseNames | foreach {
-            $BaseName=$_
-            $AllDumpsBase=$AllDumps | Where-Object {$_.BaseName -eq $BaseName}
-            GetOldDumps -Dumps $AllDumpsBase -KeepSettings $DefaultKeepSettings | foreach {
-                $MustBeRemoved+=$_
+        $AllDumps = New-Object System.Collections.ArrayList
+        foreach ($DumpPath in $DumpPaths){
+            Write-Verbose "GetDumps -BackupPath $DumpPath -Deph $RecurseDeph"
+            GetDumps -BackupPath $DumpPath -Deph $RecurseDeph -Credential $Credential -RcloneCredential $RcloneCredential | foreach {
+                $AllDumps.Add($_) | Out-Null
             }
         }
+        if ([int]$AllDumps.count -eq 0){
+            Write-Error "Backup not found" -ErrorAction Stop
+        }
+
+        $MustBeRemoved=@()
+        $AllKeepSettings | foreach {
+            $BaseName=$_.basename
+            $KeepSettings=$_
+            $AllDumpsBase=@()
     
-      
-    }
-    $Results=@()
 
-    $MustBeRemoved | Sort-Object -property BaseName -Unique |  foreach {
-        $BaseName=$_.basename
-        $Result=New-Object -TypeName psobject 
-        $Result | Add-Member -MemberType NoteProperty -Name BaseName -Value $BaseName
-        $Result | Add-Member -MemberType NoteProperty -Name TotalDeleted -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldVersions -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldDiffVersions -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldTrnVersions -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldWeekly -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldMonthly -Value $([int]0)
-        $Result | Add-Member -MemberType NoteProperty -Name OldYearly -Value $([int]0)
-
-        $Results+=$Result
-    }
-    if ($MustBeRemoved.Count -gt 0){
-        $MustBeRemoved | foreach {
-            $FullName=$_.fullName
-            $BaseName=$_.BaseName
-            $StorageType=$_.Storage
-            $IsDaily=$_.IsDaily
-            $IsWeekly=$_.IsWeekly
-            $IsMonthly=$_.IsMonthly
-            $IsYearly=$_.IsYearly
-            $IsDiff=$_.IsDiff
-            $IsTrn=$_.IsTrn
-            $BlockDelete=$_.BlockDelete
+                $AllDumps.Clone() | Where-Object {$_.BaseName -eq $BaseName} | foreach {
+                    $AllDumpsBase+=$_
+                    $AllDumps.Remove($_)
+                } 
+    
+                if ($AllDumpsBase.Count -ne 0){
+                    GetOldDumps -Dumps $AllDumpsBase -KeepSettings $KeepSettings | foreach {
+                        $MustBeRemoved+=$_
             
-            if (!([string]::IsNullOrEmpty($FullName))){
-                if ($BlockDelete -eq $false){
-                    RemoveDump -Path $FullName -StorageType $StorageType -Credential $Credential -WhatIf:$([bool]$WhatIfPreference.IsPresent)
-                    if ($?){
-                        $Results | Where-Object {$_.Basename -eq $BaseName} | foreach {
-                            if ($IsDaily){
-                               $_.OldVersions+=1
-                            }
-                            elseif($IsDiff){
-                                $_.OldDiffVersions+=1
-                            }
-                            elseif($IsTrn){
-                                $_.OldTrnVersions+=1
-                            }
-                            elseif($IsWeekly) {
-                                $_.OldWeekly+=1
-                            }
-                            elseif($IsMonthly){
-                                $_.OldMonthly+=1
-                            }
-                            elseif($IsYearly){
-                                $_.OldYearly+=1
-                            }   
-                            $_.TotalDeleted+=1
-                        }    
-                    }    
-                
+                    }
                 }
                 else{
-                    Write-Verbose "File is locked. There may be log files or differential copies associated with this file, or ArchiveBit is installed. Skip delete $FullName" -Verbose
+                    Write-Verbose "Skip Base $BaseName"
                 }
+        
+        }
 
-
+        if ($AllDumps.count -ne 0 -and !([string]::IsNullOrEmpty($DefaultKeepSettings))){
+            $BaseNames=$AllDumps | Select-Object -Property BaseName -Unique | foreach {$_.basename}
+            $BaseNames | foreach {
+                $BaseName=$_
+                $AllDumpsBase=$AllDumps | Where-Object {$_.BaseName -eq $BaseName}
+                GetOldDumps -Dumps $AllDumpsBase -KeepSettings $DefaultKeepSettings | foreach {
+                    $MustBeRemoved+=$_
+                }
             }
+    
+      
+        }
+        $Results=@()
+
+        $MustBeRemoved | Sort-Object -property BaseName -Unique |  foreach {
+            $BaseName=$_.basename
+            $Result=New-Object -TypeName psobject 
+            $Result | Add-Member -MemberType NoteProperty -Name BaseName -Value $BaseName
+            $Result | Add-Member -MemberType NoteProperty -Name TotalDeleted -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldVersions -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldDiffVersions -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldTrnVersions -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldWeekly -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldMonthly -Value $([int]0)
+            $Result | Add-Member -MemberType NoteProperty -Name OldYearly -Value $([int]0)
+
+            $Results+=$Result
+        }
+        if ($MustBeRemoved.Count -gt 0){
+            $MustBeRemoved | foreach {
+                $FullName=$_.fullName
+                $BaseName=$_.BaseName
+                $StorageType=$_.Storage
+                $IsDaily=$_.IsDaily
+                $IsWeekly=$_.IsWeekly
+                $IsMonthly=$_.IsMonthly
+                $IsYearly=$_.IsYearly
+                $IsDiff=$_.IsDiff
+                $IsTrn=$_.IsTrn
+                $BlockDelete=$_.BlockDelete
+            
+                if (!([string]::IsNullOrEmpty($FullName))){
+                    if ($BlockDelete -eq $false){
+                        RemoveDump -Path $FullName -StorageType $StorageType -Credential $Credential -RcloneCredential $RcloneCredential -WhatIf:$([bool]$WhatIfPreference.IsPresent)
+                        if ($?){
+                            $Results | Where-Object {$_.Basename -eq $BaseName} | foreach {
+                                if ($IsDaily){
+                                   $_.OldVersions+=1
+                                }
+                                elseif($IsDiff){
+                                    $_.OldDiffVersions+=1
+                                }
+                                elseif($IsTrn){
+                                    $_.OldTrnVersions+=1
+                                }
+                                elseif($IsWeekly) {
+                                    $_.OldWeekly+=1
+                                }
+                                elseif($IsMonthly){
+                                    $_.OldMonthly+=1
+                                }
+                                elseif($IsYearly){
+                                    $_.OldYearly+=1
+                                }   
+                                $_.TotalDeleted+=1
+                            }    
+                        }    
+                
+                    }
+                    else{
+                        Write-Verbose "File is locked. There may be log files or differential copies associated with this file, or ArchiveBit is installed. Skip delete $FullName" -Verbose
+                    }
+
+
+                }
         
 
-        }     
-        $Results
+            }     
+            $Results
+        }
+        else{
+            Write-Verbose "Old backup versions not found" -Verbose
+        }
+        if($StartRcloneServer){
+            $RcloneServer.PowerShell.Dispose()
+            Remove-Variable -Name RcloneServer -Force -Scope Global -WhatIf:$false
+        }
+    }catch{
+        Write-Error $_
+        if($StartRcloneServer){
+                $RcloneServer.PowerShell.Dispose()
+                Remove-Variable -Name RcloneServer -Force -Scope Global -WhatIf:$false
+        }   
     }
-    else{
-        Write-Verbose "Old backup versions not found" -Verbose
-    }
-    if($StartRcloneServer){
-        $RcloneServer.PowerShell.Dispose()
-        Remove-Variable -Name RcloneServer -Force -Scope Global -WhatIf:$false
-    }
+    
 
 }
 function RenameBackup{
@@ -1955,4 +1994,61 @@ function ReadJsonConfig{
     } else{
         ConvertFromJson20 -item $JsonRaw -ErrorAction Stop
     }
+}
+function CreateCredential{
+    [cmdletbinding()]
+    param(
+        [parameter(Mandatory=$true)]
+        [string]$User,
+        [string]$Password
+    )
+    
+    Write-Verbose "Create Credential User $User, Password $password"
+    
+    if ($PSBoundParameters["Password"])
+    {
+        $SecPassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
+        $Credential = New-Object System.Management.Automation.PSCredential($User,$SecPassword)  
+    }
+    else
+    {
+        $Credential = New-Object System.Management.Automation.PSCredential($User,(new-object System.Security.SecureString))
+    }
+    
+    
+    $Credential
+}
+function GetPlainTextPassword ($SecString){
+    $BSTR =[System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecString)
+    $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    $PlainPassword
+}
+function NewPassword{
+    [cmdletbinding()]
+    param(
+        [int]$Length=18,
+        [ValidateSet("Max",'Middle',"Min")]
+        [string]$Сomplexity="Middle"
+    )
+    
+    function Scramble-String([string]$inputString)
+    {     
+        $characterArray = $inputString.ToCharArray()   
+        $scrambledStringArray = $characterArray | Get-Random -Count $characterArray.Length     
+        $outputString = -join $scrambledStringArray
+        return $outputString 
+    }
+    function Get-RandomCharacters($length, $characters) 
+    { 
+        $random = 1..$length | ForEach-Object { Get-Random -Maximum $characters.length } 
+        $private:ofs="" 
+        return [String]$characters[$random]
+    }
+    $password = Get-RandomCharacters -length $Length -characters 'abcdefghiklmnoprstuvwxyzABCDEFGHKLMNOPRSTUVWXYZ1234567890'
+    $password += Get-RandomCharacters -length 1 -characters 'ABCDEFGHKLMNOPRSTUVWXYZ'
+    $password += Get-RandomCharacters -length 1 -characters '1234567890'
+    #$password += Get-RandomCharacters -length 1 -characters '!"§$%&/()=?}][{@#*+'
+
+    $password = Scramble-String $password
+    return $password
 }

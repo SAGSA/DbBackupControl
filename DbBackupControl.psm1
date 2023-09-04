@@ -33,13 +33,10 @@
     Specify ftp credentials if the backup files are located on ftp.
 
 .EXAMPLE
-    Remove-DbBackup -Path "C:\MSSQL\BACKUP"
-    All backup files in "C:\MSSQL\BACKUP" will be removed. Files in the subdirectory will not be affected
-.EXAMPLE
-    Remove-DbBackup -Path 'C:\MSSQL\BACKUP' -DbName "db1","db2" -KeepVersions 7
+    Remove-DbBackup -Path 'C:\MSSQL\BACKUP' -DbName "db1","db2" -KeepVersions 7 -Deph 2
     Only the 7 most recent versions of db1 and db2 will be kept
 .EXAMPLE
-    Remove-DbBackup -Path 'C:\MSSQL\BACKUP' -DbName "db1","db2" -KeepVersions 7 -WhatIf
+    Remove-DbBackup -Path 'C:\MSSQL\BACKUP' -DbName "db1","db2" -KeepVersions 7 -Deph 2 -WhatIf
     Same as example #2, but doesn't actually remove any files. The function will instead show you what would be done.
     This is useful when first experimenting with using the function.
 .EXAMPLE
@@ -54,12 +51,12 @@
         - 12 last monthly backups (by default day of month is 28)
         - 5  last yearly  backups (by default day of year is 365)
 .EXAMPLE
-    Remove-DbBackup -Path 'C:\MSSQL\BACKUP' -KeepVersionsMonthly 12 -DayOfMonth 1,28 -KeepVersionsYearly 6 -DayOfYear 1,365
+    Remove-DbBackup -Path "\\server\share\backup" -KeepVersionsMonthly 12 -DayOfMonth 1,28 -KeepVersionsYearly 6 -DayOfYear 1,365
     After executing this command, the following will be saved:
     - 12 last monthly backups made 1 and 28 day of month
     - 6 last yearly bakups made 1 and 365 day of year
 .EXAMPLE
-    Remove-DbBackup -Path mega: -Deph 3 -KeepVersions 3
+    Remove-DbBackup -Path mega:backup\SqlBackup -Deph 2 -KeepVersions 3
     Only the 3 latest versions of the database copy on mega cloud storage will be kept. You need to download rclone to the C:\Windows\PsScript folder and configure it. https://rclone.org/
 .NOTES
     Author: SAGSA
@@ -68,7 +65,7 @@
 #>    
     [cmdletbinding(SupportsShouldProcess=$true)]
     param(
-        [ValidateScript({($_ -match "^ftp://") -or $_ -match "^\w+:"})]
+        [ValidateScript({($_ -match "^ftp://") -or $_ -match "^\w+:" -or "^\\\\.+"})]
         [string[]]$Path,
         [ValidateScript({-not ($_ -match "\s+")})]
         [string[]]$DbName,
@@ -168,7 +165,10 @@
             }  
         }
         
-    
+    $CountDefProperties=($DefaultKeepSettings | Get-Member | Where-Object {$_.MemberType -eq "NoteProperty"}).count
+    if ($CountDefProperties -le 2){
+        Write-Error "At least one of the parameters: KeepVersions,KeepVersionsWeekly,KeepVersionsMonthly,KeepVersionsYearly,KeepVersionsTrn,KeepVersionsDiff must be specified" -ErrorAction Stop
+    }
     RemoveOldDumps -DumpPaths $Path -AllKeepSettings $AllKeepSettings -DefaultKeepSettings $DefaultKeepSettings -RecurseDeph $Deph -Credential $FtpCredential -WhatIf:$([bool]$WhatIfPreference.IsPresent)
     
     
@@ -275,7 +275,16 @@ function Remove-ItemRclone{
     }
     if ($([bool]$WhatIfPreference.IsPresent) -eq $false){
         Write-Verbose "Delete file $Path"
-        $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/deletefile" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
+        if($PSVersionTable["psversion"] -ge [version]"3.0"){
+            Write-Verbose "Invoke-WebRequest -Uri http://localhost:5572/operations/deletefile"
+            $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/deletefile" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
+        }else{
+            Write-Verbose "InvokeWebRequest -Uri http://localhost:5572/operations/deletefile"
+            Write-Debug -Message dbg -Debug
+            $Res=InvokeWebRequest -uri "http://localhost:5572/operations/deletefile" -Method POST -Body $ApiParam -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
+        
+        }
+        
         if ($Res.StatusCode -ne 200){
             Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
         }
@@ -314,11 +323,23 @@ function Get-ChildItemRclone{
         }
         
     }
-    $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/list" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop
+    if($PSVersionTable["psversion"] -ge [version]"3.0"){
+        Write-Verbose "Invoke-WebRequest -Uri http://localhost:5572/operations/list"
+        $Res=Invoke-WebRequest -Uri "http://localhost:5572/operations/list" -Method Post -Body $ApiParam -UseBasicParsing -ContentType "application/json" -Credential $RcloneCredential -ErrorAction Stop    
+    }else{
+        Write-Verbose "InvokeWebRequest -Uri http://localhost:5572/operations/list"
+        $Res=InvokeWebRequest -uri "http://localhost:5572/operations/list" -Method POST -Body $ApiParam -ContentType "application/json" -Credential $RcloneCredential
+        
+    }
     if ($Res.StatusCode -ne 200){
         Write-Error "Invoke-WebRequest error $($Res.StatusCode)" -ErrorAction Stop
     }
-    $ItemsInfo=($Res.content | ConvertFrom-Json).list
+    if($PSVersionTable["psversion"] -ge [version]"3.0"){
+        $ItemsInfo=($Res.content | ConvertFrom-Json).list
+    }else{
+        $ItemsInfo=(ConvertFromJson20 -item $($Res.content)).list
+    }
+    #Write-Debug -Message dbg -Debug
     $ItemsInfo | foreach {
         $Path=$_.Path
         $Name=$_.name
@@ -382,7 +403,7 @@ function New-FakeBackup{
     [CmdletBinding()]
     param(
         [parameter(Mandatory=$true)]
-        [ValidateScript({$_ -match "^\w:\\"})]
+        [ValidateScript({$_ -match "^\w:\\" -or $_ -match "^\\\\.+"})]
         [string]$Path,
         [parameter(Mandatory=$true)]
         [string]$BaseName,
@@ -1055,7 +1076,7 @@ function GetDirRecurse{
     )
     
     if ($PSBoundParameters['Deph'] -gt 0){
-        if ($Path -match "^.+:\\"){
+        if ($Path -match "^.+:\\" -or $Path -match "^\\\\.+"){
            $Dirs=Get-ChildItem -Path $Path
         }
         elseif($Path -match "^ftp://"){
@@ -1096,7 +1117,7 @@ function GetDumps{
     )
     [string[]]$OtherMssqlExtensions="diff","trn"
     $AllPaths=@()
-    if ($BackupPath -match "^.+:\\"){
+    if ($BackupPath -match "^.+:\\" -or $Path -match "^\\\\.+"){
         $AllPaths+=Get-Item -Path $BackupPath -ErrorAction Stop
         $Storage="disk"
     }
@@ -1129,101 +1150,104 @@ function GetDumps{
     
     $AllPaths | foreach {
         $Path=$_.fullname
-        if ($BackupPath -match "^.+:\\"){
-            Write-Verbose "Get-ChildItem -Path $Path"
-            $DumpItems=Get-ChildItem -Path $Path 
-        }
-        elseif($BackupPath -match "^ftp://"){
-            Write-Verbose "ListFtpDirectory -Url $Path"
-            $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
-        }
-        else{
-            Write-Verbose "Get-ChildItemRclone -Path $Path"
-            $DumpItems=Get-ChildItemRclone -Path $Path -RcloneCredential $RcloneCredential
-        }
-        <#if ($Path -match "^ftp://"){
-            Write-Verbose "ListFtpDirectory -Url $Path"
-            $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
-        }
-        else{
-            Write-Verbose "Get-ChildItem -Path $Path"
-            $DumpItems=Get-ChildItem -Path $Path    
-        }#>
-        
-        $AllBackups=$DumpItems | Where-Object {$_.PSIsContainer -eq $false}
-        $OutObjects=@()
-        $AllBackups | foreach {
-            $FileName=$_.Name
-            $FullName=$_.FullName
-            $FileAttributes=$_.Attributes
-            #$LastWriteTime=$_.LastWriteTime
-            #$Length=$_.Length
-            if ($FileName -match "^(.+)_(.+)_([\d]{4})_([\d]{2})_([\d]{2})_([\d]{2})([\d]{2})([\d]{2}).*\.(.+)$"){
-                
-                #"(.+)_([\d]{8})_([\d]{4})\..+$"
-                $BaseName=$Matches[1]
-                $Year=$Matches[3]
-                $Month=$Matches[4]
-                $Day=$Matches[5]
-                $Hour=$Matches[6]
-                $Minute=$Matches[7]
-                $Second=$Matches[8]
-                $Extension=$Matches[9]
-                #$Date=$Matches[2]
-                #$Time=$Matches[3]
-                <#if ($Date -match "^(\d\d)(\d\d)(\d\d\d\d)$"){
-                    $Day=$Matches[1]
-                    $Month=$Matches[2]
-                    $Year=$Matches[3]
-                }
-                else{
-                    Write-Error "Incorrect Date string $Date" -ErrorAction Stop
-                }
-                if ($Time -match "^(\d\d)(\d\d)$"){
-                    $Hour=$Matches[1]
-                    $Minute=$Matches[2]
-                }
-                else{
-                    Write-Error "Incorrect time string $Time" -ErrorAction Stop
-                }#>
-                $BackupCreateDate=Get-Date -Day $Day -Month $Month -Year $Year -Hour $Hour -Minute $Minute -Second $Second
-                #$DumpItem=Get-Item -Path $FullName
-                $IsLogOrDiff=$false
-                if ($OtherMssqlExtensions -eq $Extension){
-                    $IsLogOrDiff=$true
-                }
-                $ArchiveBitIsPresent=$false
-                if ($Storage -eq "Disk"){
-                    if ((($FileAttributes -band [io.fileattributes]::Archive).value__ -eq 32) -or (($FileAttributes -band [io.fileattributes]::Archive) -eq 32)){
-                        $ArchiveBitIsPresent=$true
-                    }
-              
-                }
-                $OutObject=New-Object -TypeName psobject -Property @{
-                    "BaseName"=$($BaseName.ToLower());
-                    "FullName"=$FullName;
-                    "FileName"=$FileName;
-                    "CreateDate"=$BackupCreateDate;
-                    "Extension"=$Extension;
-                    "Storage"=$Storage;
-                    "IsLogOrDiff"=$IsLogOrDiff;
-                    "ArchiveBitIsPresent"=$ArchiveBitIsPresent
-                    #"Length"=$DumpItem.Length
-
-                }
-                $OutObjects+=$OutObject
-
+        if(-not $([string]::IsNullOrEmpty($Path))){
+            if ($BackupPath -match "^.+:\\" -or $Path -match "^\\\\.+"){
+                Write-Verbose "Get-ChildItem -Path $Path"
+                $DumpItems=Get-ChildItem -Path $Path 
+            }
+            elseif($BackupPath -match "^ftp://"){
+                Write-Verbose "ListFtpDirectory -Url $Path"
+                $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
             }
             else{
-                Write-Verbose "Skip $FullName incorrect name format. Correct format ^basename_.+_yyyy_MM_dd_HHmmss.*\.(.+)$" -Verbose
-            } 
+                Write-Verbose "Get-ChildItemRclone -Path $Path"
+                $DumpItems=Get-ChildItemRclone -Path $Path -RcloneCredential $RcloneCredential
+            }
+            <#if ($Path -match "^ftp://"){
+                Write-Verbose "ListFtpDirectory -Url $Path"
+                $DumpItems=ListFtpDirectory -Url $Path -Credential $Credential
+            }
+            else{
+                Write-Verbose "Get-ChildItem -Path $Path"
+                $DumpItems=Get-ChildItem -Path $Path    
+            }#>
+        
+            $AllBackups=$DumpItems | Where-Object {$_.PSIsContainer -eq $false}
+            $OutObjects=@()
+            $AllBackups | foreach {
+                $FileName=$_.Name
+                $FullName=$_.FullName
+                $FileAttributes=$_.Attributes
+                #$LastWriteTime=$_.LastWriteTime
+                #$Length=$_.Length
+                if ($FileName -match "^(.+)_(.+)_([\d]{4})_([\d]{2})_([\d]{2})_([\d]{2})([\d]{2})([\d]{2}).*\.(.+)$"){
+                
+                    #"(.+)_([\d]{8})_([\d]{4})\..+$"
+                    $BaseName=$Matches[1]
+                    $Year=$Matches[3]
+                    $Month=$Matches[4]
+                    $Day=$Matches[5]
+                    $Hour=$Matches[6]
+                    $Minute=$Matches[7]
+                    $Second=$Matches[8]
+                    $Extension=$Matches[9]
+                    #$Date=$Matches[2]
+                    #$Time=$Matches[3]
+                    <#if ($Date -match "^(\d\d)(\d\d)(\d\d\d\d)$"){
+                        $Day=$Matches[1]
+                        $Month=$Matches[2]
+                        $Year=$Matches[3]
+                    }
+                    else{
+                        Write-Error "Incorrect Date string $Date" -ErrorAction Stop
+                    }
+                    if ($Time -match "^(\d\d)(\d\d)$"){
+                        $Hour=$Matches[1]
+                        $Minute=$Matches[2]
+                    }
+                    else{
+                        Write-Error "Incorrect time string $Time" -ErrorAction Stop
+                    }#>
+                    $BackupCreateDate=Get-Date -Day $Day -Month $Month -Year $Year -Hour $Hour -Minute $Minute -Second $Second
+                    #$DumpItem=Get-Item -Path $FullName
+                    $IsLogOrDiff=$false
+                    if ($OtherMssqlExtensions -eq $Extension){
+                        $IsLogOrDiff=$true
+                    }
+                    $ArchiveBitIsPresent=$false
+                    if ($Storage -eq "Disk"){
+                        if ((($FileAttributes -band [io.fileattributes]::Archive).value__ -eq 32) -or (($FileAttributes -band [io.fileattributes]::Archive) -eq 32)){
+                            $ArchiveBitIsPresent=$true
+                        }
+              
+                    }
+                    $OutObject=New-Object -TypeName psobject -Property @{
+                        "BaseName"=$($BaseName.ToLower());
+                        "FullName"=$FullName;
+                        "FileName"=$FileName;
+                        "CreateDate"=$BackupCreateDate;
+                        "Extension"=$Extension;
+                        "Storage"=$Storage;
+                        "IsLogOrDiff"=$IsLogOrDiff;
+                        "ArchiveBitIsPresent"=$ArchiveBitIsPresent
+                        #"Length"=$DumpItem.Length
+
+                    }
+                    $OutObjects+=$OutObject
+
+                }
+                else{
+                    Write-Verbose "Skip $FullName incorrect name format. Correct format ^basename_.+_yyyy_MM_dd_HHmmss.*\.(.+)$" -Verbose
+                } 
+            }
+            if ($OutObjects.Count -eq 0){
+                Write-Verbose "Backup not found in folder $Path"
+            }
+            else{
+                $OutObjects | Sort-Object -Property CreateDate
+            }    
         }
-        if ($OutObjects.Count -eq 0){
-            Write-Verbose "Backup not found in folder $Path"
-        }
-        else{
-            $OutObjects | Sort-Object -Property CreateDate
-        }    
+        
     }
     
     
@@ -2051,4 +2075,66 @@ function NewPassword{
 
     $password = Scramble-String $password
     return $password
+}
+function InvokeWebRequest{
+    [cmdletbinding()]
+    Param(
+        [string]$uri,
+        [ValidateSet("GET","POST")]
+        $Method="GET",
+        $Body,
+        $Credential,
+        $Headers,
+        [string]$ContentType
+    )
+    if($script:cookiejar -eq $Null){
+        $script:cookiejar = New-Object System.Net.CookieContainer     
+    }
+    $maxAttempts = 3
+    $attempts=0
+    while($true){
+        $attempts++
+        try{
+            $retVal = @{}
+            $request = [System.Net.WebRequest]::Create($uri)
+            $request.TimeOut = 5000
+            $request.Method = $method
+            if($PSBoundParameters["Credential"] -ne $Null){
+                $request.Credentials = $Credential
+            }
+            if($Headers){
+                $Headers.Keys | foreach { 
+                    $request.Headers[$_] = $Headers.Item($_)
+                }
+            }
+            $request.UserAgent = "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 10.0; WOW64; Trident/7.0; .NET4.0C; .NET4.0E)"
+            if(!([string]::IsNullOrEmpty($PSBoundParameters["ContentType"]))){
+                $request.ContentType = $ContentType
+            }else{
+                $request.ContentType = "application/x-www-form-urlencoded"
+            }
+            
+            $request.CookieContainer = $script:cookiejar
+            if($method -eq "POST"){
+                $body = [byte[]][char[]]$body
+                $upStream = $request.GetRequestStream()
+                $upStream.Write($body, 0, $body.Length)
+                $upStream.Flush()
+                $upStream.Close()
+            }
+            $response = $request.GetResponse()
+            $retVal.StatusCode = $response.StatusCode
+            $retVal.StatusDescription = $response.StatusDescription
+            $retVal.Headers = $response.Headers
+            $stream = $response.GetResponseStream()
+            $streamReader = [System.IO.StreamReader]($stream)
+            $retVal.Content = $streamReader.ReadToEnd()
+            $streamReader.Close()
+            $response.Close()
+            return $retVal
+        }catch{
+            Write-Error $_
+            if($attempts -ge $maxAttempts){Throw}else{sleep -s 2}
+        }
+    }
 }

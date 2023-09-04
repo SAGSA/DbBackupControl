@@ -1,5 +1,5 @@
 # What's this?
-This module provides wide functionality to delete SQL backups from disk or ftp.
+This module provides wide functionality to delete SQL backups from disk, ftp or cloud storage.
 Allows you to organize custom backup retention policies.
 Implemented functionality to block deletion of .bak files if .diff or .trn depend on them
 # Module Installation
